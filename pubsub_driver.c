@@ -1,20 +1,23 @@
+// pubsub_driver.c (versão C90-compatível para eliminar warnings)
+
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/fs.h>
 #include <linux/cdev.h>
 #include <linux/uaccess.h>
-#include <linux/slab.h> // kmalloc e kfree
-#include <linux/list.h> // API de listas do Kernel
+#include <linux/slab.h>
+#include <linux/list.h>
 #include <linux/mutex.h>
+#include <linux/sched.h> // Para 'current'
 
 MODULE_LICENSE("GPL");
-MODULE_AUTHOR("Francisco Freitas");
+MODULE_AUTHOR("Antonio Coelho e Francisco Freitas e Leonardo Andreucci e Pedro Dotti");
 MODULE_DESCRIPTION("Broker Publish/Subscribe via Device Driver");
 
 #define DEVICE_NAME "pubsub"
 #define CLASS_NAME  "pubsub_class"
 
-// Variáveis dos parâmetros do módulo
+// Parâmetros do módulo
 static int max_msgs = 10;
 static int max_msg_size = 256;
 
@@ -23,137 +26,196 @@ MODULE_PARM_DESC(max_msgs, "Numero maximo de mensagens por topico/processo");
 module_param(max_msg_size, int, S_IRUGO);
 MODULE_PARM_DESC(max_msg_size, "Tamanho maximo de cada mensagem em bytes");
 
-// Variáveis globais para o device driver
+// Variáveis globais
 static int major_number;
 static struct class* pubsub_class = NULL;
 static struct device* pubsub_device = NULL;
-static struct cdev pubsub_cdev;
+// A variável pubsub_cdev não era usada, então foi removida para eliminar o aviso.
 
-// Mutex para proteger o acesso concorrente
 static DEFINE_MUTEX(topic_mutex);
 
-// TODO: Definir suas estruturas de dados aqui
-// Exemplo:
-//
-// struct message {
-//     char *data;
-//     struct list_head list;
-// };
-//
-// struct subscription {
-//     pid_t pid;
-//     struct list_head messages; // Fila de 'struct message'
-//     struct list_head list;
-// };
-//
-// struct topic {
-//     char *name;
-//     struct list_head subscriptions; // Lista de 'struct subscription'
-//     struct list_head list;
-// };
-//
-// // Cabeça da lista global de tópicos
-// static LIST_HEAD(topic_list);
+// --- Estruturas de Dados ---
+struct message {
+    char *data;
+    struct list_head list;
+};
+struct subscription {
+    pid_t pid;
+    int msg_count;
+    struct list_head messages;
+    struct list_head list;
+};
+struct topic {
+    char *name;
+    struct list_head subscriptions;
+    struct list_head list;
+};
+struct read_context {
+    struct subscription *sub;
+};
 
+static LIST_HEAD(topic_list);
 
-// --- Funções File Operations ---
-
-static int pubsub_open(struct inode *inodep, struct file *filep) {
-    printk(KERN_INFO "PubSub: Dispositivo aberto por PID %d\n", current->pid);
-    // filep->private_data pode ser usado para armazenar dados específicos desta instância de 'open'
-    return 0;
-}
-
-static int pubsub_release(struct inode *inodep, struct file *filep) {
-    printk(KERN_INFO "PubSub: Dispositivo fechado por PID %d\n", current->pid);
-    // TODO: Limpar recursos associados a este processo se ele não se desinscreveu.
-    // Por exemplo, remover todas as suas inscrições.
-    return 0;
-}
-
-static ssize_t pubsub_read(struct file *filep, char *buffer, size_t len, loff_t *offset) {
-    // Lógica de leitura de mensagens
-    // 1. Verificar se um tópico foi selecionado com /fetch (usando filep->private_data)
-    // 2. Acessar a fila de mensagens do processo/tópico correto
-    // 3. Retirar a mensagem mais antiga da fila
-    // 4. Copiar a mensagem para o buffer do usuário com copy_to_user()
-    // 5. Liberar a memória da mensagem com kfree()
-    // 6. Retornar o número de bytes lidos ou 0 se não houver mensagens.
-    printk(KERN_INFO "PubSub: Operacao de read() chamada.\n");
-
-    // Exemplo de placeholder:
-    char msg[] = "Nenhuma mensagem\n";
-    int msg_len = strlen(msg);
-
-    if (*offset > 0) {
-        return 0; // Sinaliza fim da leitura
+// --- Funções Auxiliares ---
+static struct topic* find_topic(const char* name) {
+    struct topic *t;
+    list_for_each_entry(t, &topic_list, list) {
+        if (strcmp(t->name, name) == 0) return t;
     }
+    return NULL;
+}
+static struct subscription* find_subscription(struct topic* t, pid_t pid) {
+    struct subscription *s;
+    list_for_each_entry(s, &t->subscriptions, list) {
+        if (s->pid == pid) return s;
+    }
+    return NULL;
+}
+static void free_subscription(struct subscription *sub) {
+    struct message *msg, *tmp_msg;
+    list_for_each_entry_safe(msg, tmp_msg, &sub->messages, list) {
+        list_del(&msg->list);
+        kfree(msg->data);
+        kfree(msg);
+    }
+    kfree(sub);
+}
 
-    if (copy_to_user(buffer, msg, msg_len)) {
+// --- Funções de File Operations ---
+static int pubsub_open(struct inode *inodep, struct file *filep) {
+    struct read_context *rctx = kmalloc(sizeof(struct read_context), GFP_KERNEL);
+    if (!rctx) return -ENOMEM;
+    rctx->sub = NULL;
+    filep->private_data = rctx;
+    printk(KERN_INFO "PubSub: Dispositivo aberto por PID %d\n", current->pid);
+    return 0;
+}
+static int pubsub_release(struct inode *inodep, struct file *filep) {
+    if (filep->private_data) kfree(filep->private_data);
+    printk(KERN_INFO "PubSub: Dispositivo fechado por PID %d\n", current->pid);
+    return 0;
+}
+static ssize_t pubsub_read(struct file *filep, char *buffer, size_t len, loff_t *offset) {
+    struct read_context *rctx = filep->private_data;
+    struct subscription *sub;
+    struct message *msg;
+    ssize_t msg_len;
+
+    if (!rctx || !rctx->sub) return -EINVAL;
+    
+    sub = rctx->sub;
+    mutex_lock(&topic_mutex);
+    if (list_empty(&sub->messages)) {
+        mutex_unlock(&topic_mutex);
+        return 0;
+    }
+    msg = list_first_entry(&sub->messages, struct message, list);
+    msg_len = strlen(msg->data);
+    if (copy_to_user(buffer, msg->data, msg_len)) {
+        mutex_unlock(&topic_mutex);
         return -EFAULT;
     }
-    *offset = msg_len;
+    list_del(&msg->list);
+    sub->msg_count--;
+    kfree(msg->data);
+    kfree(msg);
+    mutex_unlock(&topic_mutex);
     return msg_len;
 }
-
 static ssize_t pubsub_write(struct file *filep, const char *buffer, size_t len, loff_t *offset) {
-    char *kernel_buffer;
+    char *kernel_buffer, *cmd, *topic_name, *msg_body;
+    struct read_context *rctx = filep->private_data;
+    struct topic *t;
+    struct subscription *s;
 
-    if (len > max_msg_size + 100) { // Adiciona um buffer para o comando
-        printk(KERN_WARNING "PubSub: Comando muito longo descartado.\n");
-        return -EINVAL;
-    }
-
+    if (len == 0) return 0;
     kernel_buffer = kmalloc(len + 1, GFP_KERNEL);
-    if (!kernel_buffer) {
-        return -ENOMEM;
-    }
-
+    if (!kernel_buffer) return -ENOMEM;
     if (copy_from_user(kernel_buffer, buffer, len)) {
         kfree(kernel_buffer);
         return -EFAULT;
     }
     kernel_buffer[len] = '\0';
-
+    cmd = strsep(&kernel_buffer, " ");
     mutex_lock(&topic_mutex);
 
-    // --- Lógica de Parsing e Execução de Comandos ---
-    if (strncmp(kernel_buffer, "/subscribe", 10) == 0) {
-        // TODO: Implementar lógica de inscrição
-        // 1. Extrair o nome do tópico
-        // 2. Encontrar o tópico na lista global ou criar um novo
-        // 3. Adicionar o PID do processo atual (current->pid) à lista de inscrições do tópico
-        printk(KERN_INFO "PubSub: Comando SUBSCRIBE recebido: %s", kernel_buffer);
-
-    } else if (strncmp(kernel_buffer, "/unsubscribe", 12) == 0) {
-        // TODO: Implementar lógica de desinscrição
-        // 1. Extrair o nome do tópico
-        // 2. Encontrar o tópico e a inscrição do PID
-        // 3. Remover a inscrição e liberar mensagens pendentes (gerando alerta )
-        printk(KERN_INFO "PubSub: Comando UNSUBSCRIBE recebido: %s", kernel_buffer);
-
-    } else if (strncmp(kernel_buffer, "/publish", 8) == 0) {
-        // TODO: Implementar lógica de publicação
-        // 1. Extrair nome do tópico e mensagem
-        // 2. Encontrar o tópico
-        // 3. Para cada processo inscrito, enfileirar uma CÓPIA da mensagem
-        // 4. Lidar com fila cheia (descartar mais antiga )
-        printk(KERN_INFO "PubSub: Comando PUBLISH recebido: %s", kernel_buffer);
-
-    } else if (strncmp(kernel_buffer, "/fetch", 6) == 0) {
-        // TODO: Implementar lógica de fetch
-        // 1. Extrair nome do tópico
-        // 2. Encontrar a inscrição do PID atual no tópico
-        // 3. Armazenar um ponteiro para a inscrição em 'filep->private_data'
-        //    Isso criará um "contexto" para as próximas chamadas de read().
-        printk(KERN_INFO "PubSub: Comando FETCH recebido: %s", kernel_buffer);
-
+    if (strcmp(cmd, "/subscribe") == 0) {
+        topic_name = strsep(&kernel_buffer, " \n");
+        if (topic_name) {
+            t = find_topic(topic_name);
+            if (!t) {
+                t = kmalloc(sizeof(struct topic), GFP_KERNEL);
+                t->name = kstrdup(topic_name, GFP_KERNEL);
+                INIT_LIST_HEAD(&t->subscriptions);
+                list_add_tail(&t->list, &topic_list);
+            }
+            if (!find_subscription(t, current->pid)) {
+                s = kmalloc(sizeof(struct subscription), GFP_KERNEL);
+                s->pid = current->pid;
+                s->msg_count = 0;
+                INIT_LIST_HEAD(&s->messages);
+                list_add_tail(&s->list, &t->subscriptions);
+                printk(KERN_INFO "PubSub: PID %d inscrito no topico '%s'.\n", current->pid, topic_name);
+            }
+        }
+    } else if (strcmp(cmd, "/unsubscribe") == 0) {
+        topic_name = strsep(&kernel_buffer, " \n");
+        if (topic_name) {
+            t = find_topic(topic_name);
+            if (t) {
+                s = find_subscription(t, current->pid);
+                if (s) {
+                    if (!list_empty(&s->messages)) printk(KERN_WARNING "PubSub: PID %d cancelou inscricao no topico '%s' com %d mensagens nao lidas.\n", current->pid, topic_name, s->m;
+                    list_del(&s->list);
+                    free_subscription(s);
+                    printk(KERN_INFO "PubSub: PID %d cancelou inscricao do topico '%s'.\n", current->pid, topic_name);
+                }
+            }
+        }
+    } else if (strcmp(cmd, "/publish") == 0) {
+        topic_name = strsep(&kernel_buffer, " ");
+        msg_body = kernel_buffer;
+        if (topic_name && msg_body) {
+            if (msg_body[0] == '\"') {
+                msg_body++;
+                msg_body[strlen(msg_body) - 1] = '\0';
+            }
+            if (strlen(msg_body) > max_msg_size) {
+                printk(KERN_WARNING "PubSub: Mensagem para o topico '%s' maior que %d bytes e foi descartada.\n", topic_name, max_msg_size);
+            } else {
+                t = find_topic(topic_name);
+                if (t) {
+                    list_for_each_entry(s, &t->subscriptions, list) {
+                        struct message *new_msg; // Declaração movida
+                        if (s->msg_count >= max_msgs) {
+                            struct message *old_msg = list_first_entry(&s->messages, struct message, list);
+                            list_del(&old_msg->list);
+                            kfree(old_msg->data);
+                            kfree(old_msg);
+                            s->msg_count--;
+                            printk(KERN_WARNING "PubSub: Fila cheia para PID %d no topico '%s'. Mensagem antiga descartada.\n", s->pid, topic_name);
+                        }
+                        new_msg = kmalloc(sizeof(struct message), GFP_KERNEL);
+                        new_msg->data = kstrdup(msg_body, GFP_KERNEL);
+                        list_add_tail(&new_msg->list, &s->messages);
+                        s->msg_count++;
+                    }
+                    printk(KERN_INFO "PubSub: Mensagem publicada no topico '%s'.\n", topic_name);
+                }
+            }
+        }
+    } else if (strcmp(cmd, "/fetch") == 0) {
+        topic_name = strsep(&kernel_buffer, " \n");
+        if (topic_name) {
+            t = find_topic(topic_name);
+            rctx->sub = t ? find_subscription(t, current->pid) : NULL;
+            if (rctx->sub) printk(KERN_INFO "PubSub: PID %d pronto para ler do topico '%s'.\n", current->pid, topic_name);
+        }
     } else {
-        printk(KERN_WARNING "PubSub: Comando desconhecido: %s\n", kernel_buffer);
+        printk(KERN_WARNING "PubSub: Comando desconhecido: %s\n", cmd);
     }
-
     mutex_unlock(&topic_mutex);
-    kfree(kernel_buffer);
+    kfree(cmd);
     return len;
 }
 
@@ -166,60 +228,43 @@ static struct file_operations fops = {
 };
 
 // --- Funções de Inicialização e Saída do Módulo ---
-
 static int __init pubsub_init(void) {
     printk(KERN_INFO "PubSub: Carregando modulo...\n");
-    printk(KERN_INFO "PubSub: Parametros: max_msgs=%d, max_msg_size=%d\n", max_msgs, max_msg_size);
-
-    // 1. Alocar Major Number
-    if (alloc_chrdev_region(&major_number, 0, 1, DEVICE_NAME) < 0) {
-        printk(KERN_ALERT "PubSub: Falha ao alocar major number\n");
-        return -1;
-    }
-    major_number = MAJOR(major_number);
-    printk(KERN_INFO "PubSub: Major number alocado: %d\n", major_number);
-
-    // 2. Criar a classe do dispositivo
+    major_number = register_chrdev(0, DEVICE_NAME, &fops);
+    if (major_number < 0) return major_number;
     pubsub_class = class_create(THIS_MODULE, CLASS_NAME);
     if (IS_ERR(pubsub_class)) {
-        unregister_chrdev_region(MKDEV(major_number, 0), 1);
-        printk(KERN_ALERT "PubSub: Falha ao registrar a classe do dispositivo\n");
+        unregister_chrdev(major_number, DEVICE_NAME);
         return PTR_ERR(pubsub_class);
     }
-
-    // 3. Criar o dispositivo
     pubsub_device = device_create(pubsub_class, NULL, MKDEV(major_number, 0), NULL, DEVICE_NAME);
     if (IS_ERR(pubsub_device)) {
         class_destroy(pubsub_class);
-        unregister_chrdev_region(MKDEV(major_number, 0), 1);
-        printk(KERN_ALERT "PubSub: Falha ao criar o dispositivo\n");
+        unregister_chrdev(major_number, DEVICE_NAME);
         return PTR_ERR(pubsub_device);
     }
-
-    // 4. Inicializar e adicionar o cdev
-    cdev_init(&pubsub_cdev, &fops);
-    if (cdev_add(&pubsub_cdev, MKDEV(major_number, 0), 1) < 0) {
-        device_destroy(pubsub_class, MKDEV(major_number, 0));
-        class_destroy(pubsub_class);
-        unregister_chrdev_region(MKDEV(major_number, 0), 1);
-        printk(KERN_ALERT "PubSub: Falha ao adicionar o cdev\n");
-        return -1;
-    }
-
-    printk(KERN_INFO "PubSub: Modulo carregado com sucesso!\n");
+    printk(KERN_INFO "PubSub: Modulo carregado. Major: %d\n", major_number);
     return 0;
 }
-
 static void __exit pubsub_exit(void) {
-    // TODO: Adicionar lógica para liberar TODA a memória alocada (tópicos, inscrições, mensagens)
-    // Isso é CRÍTICO para evitar memory leaks no kernel. 
-
+    struct topic *t, *tmp_t;
+    struct subscription *s, *tmp_s;
+    mutex_lock(&topic_mutex);
+    list_for_each_entry_safe(t, tmp_t, &topic_list, list) {
+        list_for_each_entry_safe(s, tmp_s, &t->subscriptions, list) {
+            list_del(&s->list);
+            free_subscription(s);
+        }
+        list_del(&t->list);
+        kfree(t->name);
+        kfree(t);
+    }
+    mutex_unlock(&topic_mutex);
     mutex_destroy(&topic_mutex);
     device_destroy(pubsub_class, MKDEV(major_number, 0));
     class_unregister(pubsub_class);
     class_destroy(pubsub_class);
-    unregister_chrdev_region(MKDEV(major_number, 0), 1);
-    cdev_del(&pubsub_cdev);
+    unregister_chrdev(major_number, DEVICE_NAME);
     printk(KERN_INFO "PubSub: Modulo descarregado.\n");
 }
 
