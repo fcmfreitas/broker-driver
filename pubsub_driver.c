@@ -165,7 +165,7 @@ static ssize_t pubsub_write(struct file *filep, const char *buffer, size_t len, 
             if (t) {
                 s = find_subscription(t, current->pid);
                 if (s) {
-                    if (!list_empty(&s->messages)) printk(KERN_WARNING "PubSub: PID %d cancelou inscricao no topico '%s' com %d mensagens nao lidas.\n", current->pid, topic_name, s->m;
+                    if (!list_empty(&s->messages)) printk(KERN_WARNING "PubSub: PID %d cancelou inscricao no topico '%s' com %d mensagens nao lidas.\n", current->pid, topic_name, s->msg_count);
                     list_del(&s->list);
                     free_subscription(s);
                     printk(KERN_INFO "PubSub: PID %d cancelou inscricao do topico '%s'.\n", current->pid, topic_name);
