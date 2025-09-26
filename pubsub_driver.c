@@ -1,4 +1,4 @@
-// pubsub_driver.c (versão C90-compatível para eliminar warnings)
+// pubsub_driver.c 
 
 #include <linux/module.h>
 #include <linux/kernel.h>
